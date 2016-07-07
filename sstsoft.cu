@@ -57,8 +57,14 @@ __global__ void denseSparseMVM(float* W, float* a, int* ind, unsigned height, un
 	unsigned tid = threadIdx.x;
 	unsigned i = blockIdx.x;
 	float* pw = W + ind[i] * height;
-	P[i * height + tid] = pw[tid] * a[i];
+	P[tid * height + i] = pw[tid] * a[i];
 }
+
+__global__ void clearPsums(float* P)
+{
+	P[blockIdx.x * blockDim.x + threadIdx.x] = 0.0;
+}
+
 /*
 __global__ void sparseSparseMVM(float* W, float** Wends, int* Windices, float* a, float* aend, int* aindices, unsigned height, float** P)
 {
@@ -128,27 +134,45 @@ void mergesort(int low, int high, float* idata, float* odata, int* iind, int* oi
 		return;
 }
 
-void printGold(float* vector, int length, float* dataPtr)
+void matMul(float* matrix, float* vector, float* output, int width, int height)
 {
-	float* tempData = (float*)malloc(sizeof(float) * length);
-	int* indices = (int*)malloc(sizeof(int) * length);
-	int* tempIndices = (int*)malloc(sizeof(int) * length);
-	for (int i = 0; i < length; i++)
+	for (int i = 0; i < height; i++)
+	{
+		for (int j = 0; j < width; j++)
+		{
+			output[i] += matrix[j * height + i] * vector[j];
+		}
+	}
+}
+
+void printGold(float* matrix, float* vector, int width, int height, float* dataPtr)
+{
+	float* tempData = (float*)malloc(sizeof(float) * width);
+	int* indices = (int*)malloc(sizeof(int) * width);
+	int* tempIndices = (int*)malloc(sizeof(int) * width);
+	float* mulResult = (float*)malloc(sizeof(float) * height);
+	for (int i = 0; i < width; i++)
 		indices[i] = i;
+	for (int i = 0; i < height; i++)
+		mulResult[i] = 0.0;
+	matMul(matrix, vector, mulResult, width, height);
 	float *startAddr, *endAddr;
-	endAddr = dataPtr + length;
-	mergesort(0, length, vector, tempData, indices, tempIndices);
+	endAddr = dataPtr + width;
+	mergesort(0, width - 1, vector, tempData, indices, tempIndices);
 	int index = 0;
 	while (tempData[index] == 0.0)
 		index++;
 	startAddr = dataPtr + index;
 	printf("CPU results:\n");
-	printf("Start pointer: %p End pointer: %p\n", startAddr - 1, endAddr);
-	for (int i = startAddr - dataPtr; i <= endAddr - dataPtr; i++)
+	printf("Start pointer: %p End pointer: %p\n", startAddr, endAddr);
+	for (int i = startAddr - dataPtr; i < endAddr - dataPtr; i++)
 		printf("Value: %f Index: %d\n", tempData[i], tempIndices[i]);
+	for (int i = 0; i < height; i++)
+		printf("Output: %f\n", mulResult[i]);	
 	free(tempData);
 	free(indices);
 	free(tempIndices);
+	free(mulResult);
 }
 
 int main()
@@ -191,11 +215,12 @@ int main()
 	cudaError_t err1 = cudaMallocManaged(&data, sizeof(float) * WIDTH, cudaMemAttachGlobal);
 	cudaError_t err2 = cudaMallocManaged(&indices, sizeof(int) * WIDTH, cudaMemAttachGlobal);
 	cudaError_t err3 = cudaMallocManaged(&startAddr, sizeof(float), cudaMemAttachGlobal);
+	cudaError_t err4 = cudaMalloc(&output, sizeof(float) * HEIGHT);
 	cudaError_t err5 = cudaMalloc(&matrix, sizeof(float) * HEIGHT * WIDTH);
 	cudaError_t err6 = cudaMallocManaged(lowestAddr, sizeof(float**), cudaMemAttachGlobal);
 	cudaError_t err7 = cudaMallocManaged(&endAddr, sizeof(float), cudaMemAttachGlobal);
 	cudaError_t err8 = cudaMallocManaged(&P, sizeof(float) * HEIGHT * WIDTH);
-	if (err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess || err5 != cudaSuccess || err6 != cudaSuccess || err7 != cudaSuccess) 
+	if (err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess || err4 != cudaSuccess || err5 != cudaSuccess || err6 != cudaSuccess || err7 != cudaSuccess) 
 	{
 		CLEANUP("Failed to allocate memory on device.", 1);
 	}
@@ -206,9 +231,10 @@ int main()
 		CLEANUP("Failed to copy memory to device.", 1);
 	}
 
-	printGold(h_Act, WIDTH, data);
+	printGold(h_Mat, h_Act, WIDTH, HEIGHT, data);
 
-	setIndices<<<8, WIDTH / 8>>>(indices);
+	setIndices<<<4, WIDTH / 4>>>(indices);
+	clearPsums<<<HEIGHT, WIDTH>>>(P);
 
 	cudppCreate(&handle);
 	CUDPPConfiguration config;
@@ -231,11 +257,11 @@ int main()
 	}	
 	float* initLow = **lowestAddr;
 	cudaDeviceSynchronize();
-	findLowest<<<8, WIDTH / 16>>>(*lowestAddr, data, 0);
+	findLowest<<<2, WIDTH / 4>>>(*lowestAddr, data, 0);
 	cudaDeviceSynchronize();
 	if (**lowestAddr == initLow)
 	{
-		findLowest<<<8, WIDTH / 16>>>(*lowestAddr, data, 1);
+		findLowest<<<2, WIDTH / 4>>>(*lowestAddr, data, 1);
 		cudaDeviceSynchronize();
 	}
 	if (**lowestAddr == initLow)
@@ -253,17 +279,12 @@ int main()
 	configReduce.op = CUDPP_ADD;
 	configReduce.datatype = CUDPP_FLOAT;
 
-	cudaError_t err4 = cudaMalloc(&output, sizeof(float) * HEIGHT);
-	if (err4 != cudaSuccess)
-	{
-		CLEANUP("Failed to allocate memory on the device.", 1);
-	}	
 	res = cudppPlan(handle, &scanplan, configReduce, WIDTH, 1, 0);
 	if (res != CUDPP_SUCCESS)
 	{
 		CLEANUP("Failed to create plan.", 1);
 	}
-
+	cudaDeviceSynchronize();
 	for (int i = 0; i < HEIGHT; i++)
 	{
 		res = cudppReduce(scanplan, output + i, P + i * WIDTH, (endAddr - startAddr)); 
