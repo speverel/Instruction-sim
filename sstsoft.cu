@@ -11,20 +11,30 @@
 		printf("%s\n", s); \
 		if (h_Act)			free(h_Act); \
 		if (h_Mat)			free(h_Mat); \
+		if (h_Out)			free(h_Out); \
 		if (handle)			cudppDestroy(handle); \
 		if (data)			cudaFree(data); \
 		if (startAddr)		cudaFree(startAddr); \
 		if (endAddr)		cudaFree(endAddr); \
 		if (*lowestAddr)	cudaFree(*lowestAddr); \
-		if (indices)		cudaFree(indices); \
 		if (output)			cudaFree(output); \
+		if (indices)		cudaFree(indices); \
 		if (matrix)			cudaFree(matrix); \
 		if (P)				cudaFree(P); \
 		cudaDeviceReset(); \
 		fflush(stdout); \
 	} while (0); \
 	return v;
-
+/*
+		if (data)			cudaFree(data); \
+		if (startAddr)		cudaFree(startAddr); \
+		if (endAddr)		cudaFree(endAddr); \
+		if (*lowestAddr)	cudaFree(*lowestAddr); \
+		if (output)			cudaFree(output); \
+		if (indices)		cudaFree(indices); \
+		if (matrix)			cudaFree(matrix); \
+		if (P)				cudaFree(P); \
+*/
 __global__ void setIndices(int* indices)
 {
 	unsigned tid = threadIdx.x + blockDim.x * blockIdx.x;
@@ -134,7 +144,7 @@ void printGold(float* vector, int length, float* dataPtr)
 	startAddr = dataPtr + index;
 	printf("CPU results:\n");
 	printf("Start pointer: %p End pointer: %p\n", startAddr - 1, endAddr);
-	for (int i = startAddr - dataPtr; i < endAddr - dataPtr; i++)
+	for (int i = startAddr - dataPtr; i <= endAddr - dataPtr; i++)
 		printf("Value: %f Index: %d\n", tempData[i], tempIndices[i]);
 	free(tempData);
 	free(indices);
@@ -146,7 +156,7 @@ int main()
 	srand(time(NULL));
 	float* h_Act = (float*)malloc(sizeof(float) * WIDTH);
 	float* h_Mat = (float*)malloc(sizeof(float) * WIDTH * HEIGHT);
-	//float** h_res = (float**)malloc(sizeof(float*) * 2);
+	float* h_Out = (float*)malloc(sizeof(float) * HEIGHT);
 	float temp;
 	CUDPPHandle handle = 0;
 	CUDPPHandle scanplan = 0;
@@ -243,7 +253,7 @@ int main()
 	configReduce.op = CUDPP_ADD;
 	configReduce.datatype = CUDPP_FLOAT;
 
-	cudaError_t err4 = cudaMallocManaged(&output, sizeof(float) * (1 + endAddr - startAddr));
+	cudaError_t err4 = cudaMalloc(&output, sizeof(float) * HEIGHT);
 	if (err4 != cudaSuccess)
 	{
 		CLEANUP("Failed to allocate memory on the device.", 1);
@@ -254,7 +264,6 @@ int main()
 		CLEANUP("Failed to create plan.", 1);
 	}
 
-	cudaDeviceSynchronize();
 	for (int i = 0; i < HEIGHT; i++)
 	{
 		res = cudppReduce(scanplan, output + i, P + i * WIDTH, (endAddr - startAddr)); 
@@ -264,6 +273,12 @@ int main()
 		}
 	}
 	
+	cudaDeviceSynchronize();
+	err1 = cudaMemcpy(h_Out, output, sizeof(float) * HEIGHT, cudaMemcpyDeviceToHost);
+	if (err1 != cudaSuccess)
+	{
+		CLEANUP("Failed to copy data back to host.", 1);
+	}
 	printf("-------------------------------------\nGPU Results:\n");		
 	printf("Start pointer: %p End pointer: %p\n", startAddr, endAddr);
 	for (int i = startAddr - data; i < endAddr - data; i++)
@@ -272,7 +287,7 @@ int main()
 	}
 	for (int j = 0; j < HEIGHT; j++)
 	{
-		printf("Output: %f\n", output[j]);
+		printf("Output: %f\n", h_Out[j]);
 	}
 	cudppDestroyPlan(scanplan);
 	CLEANUP("Program completed successfully.", 0);
