@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include "../cudpp/include/cudpp.h"
 #include "../cudpp/include/cudpp_config.h"
-#define WIDTH 32
-#define HEIGHT 32
+#include "../cuda/6.5/include/cublas_v2.h"
+#include <cuda_runtime.h>
+#define WIDTH 64
+#define HEIGHT 64
 #define MAX_VAL 120
 
 #define CLEANUP(s, v) \
@@ -13,6 +15,7 @@
 		if (h_Mat)			free(h_Mat); \
 		if (h_Out)			free(h_Out); \
 		if (handle)			cudppDestroy(handle); \
+		if (blasHandle)		cublasDestroy(blasHandle); \
 		if (data)			cudaFree(data); \
 		if (startAddr)		cudaFree(startAddr); \
 		if (endAddr)		cudaFree(endAddr); \
@@ -21,20 +24,13 @@
 		if (indices)		cudaFree(indices); \
 		if (matrix)			cudaFree(matrix); \
 		if (P)				cudaFree(P); \
+		if (blasMatrix)		cudaFree(blasMatrix); \
+		if (blasVector)		cudaFree(blasVector); \
 		cudaDeviceReset(); \
 		fflush(stdout); \
 	} while (0); \
 	return v;
-/*
-		if (data)			cudaFree(data); \
-		if (startAddr)		cudaFree(startAddr); \
-		if (endAddr)		cudaFree(endAddr); \
-		if (*lowestAddr)	cudaFree(*lowestAddr); \
-		if (output)			cudaFree(output); \
-		if (indices)		cudaFree(indices); \
-		if (matrix)			cudaFree(matrix); \
-		if (P)				cudaFree(P); \
-*/
+
 __global__ void setIndices(int* indices)
 {
 	unsigned tid = threadIdx.x + blockDim.x * blockIdx.x;
@@ -166,7 +162,7 @@ void printGold(float* matrix, float* vector, int width, int height, float* dataP
 	printf("CPU results:\n");
 	printf("Start pointer: %p End pointer: %p\n", startAddr, endAddr);
 	for (int i = startAddr - dataPtr; i < endAddr - dataPtr; i++)
-		printf("Value: %f Index: %d\n", tempData[i], tempIndices[i]);
+		printf("Input: %f Index: %d\n", tempData[i], tempIndices[i]);
 	for (int i = 0; i < height; i++)
 		printf("Output: %f\n", mulResult[i]);	
 	free(tempData);
@@ -184,6 +180,8 @@ int main()
 	float temp;
 	CUDPPHandle handle = 0;
 	CUDPPHandle scanplan = 0;
+	cublasStatus_t stat, stat2;
+	cublasHandle_t blasHandle;
 	int nnz = 0;
 	for (int i = 0; i < WIDTH; i++) // generate random floats, which are rectified
 	{
@@ -208,7 +206,7 @@ int main()
 		}
 	}
 	// allocate memory on GPU, and copy activation vector over
-	float *data, *output, *matrix, *startAddr, *endAddr, *P;
+	float *data, *output, *matrix, *startAddr, *endAddr, *P, *blasMatrix, *blasVector;
 	int* indices;
 	float** foo;
 	float*** lowestAddr = &foo;
@@ -220,7 +218,9 @@ int main()
 	cudaError_t err6 = cudaMallocManaged(lowestAddr, sizeof(float**), cudaMemAttachGlobal);
 	cudaError_t err7 = cudaMallocManaged(&endAddr, sizeof(float), cudaMemAttachGlobal);
 	cudaError_t err8 = cudaMallocManaged(&P, sizeof(float) * HEIGHT * WIDTH);
-	if (err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess || err4 != cudaSuccess || err5 != cudaSuccess || err6 != cudaSuccess || err7 != cudaSuccess) 
+	cudaError_t err9 = cudaMalloc(&blasMatrix, sizeof(float) * HEIGHT * WIDTH);
+	cudaError_t err10 = cudaMalloc(&blasVector, sizeof(float) * WIDTH);
+	if (err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess || err4 != cudaSuccess || err5 != cudaSuccess || err6 != cudaSuccess || err7 != cudaSuccess || err8 != cudaSuccess || err9 != cudaSuccess || err10 != cudaSuccess) 
 	{
 		CLEANUP("Failed to allocate memory on device.", 1);
 	}
@@ -231,11 +231,40 @@ int main()
 		CLEANUP("Failed to copy memory to device.", 1);
 	}
 
+	stat = cublasCreate(&blasHandle);
+	if (stat != CUBLAS_STATUS_SUCCESS)
+	{
+		CLEANUP("Failed to create cuBLAS handle.", 1);
+	}
+	stat = cublasSetMatrix(HEIGHT, WIDTH, sizeof(float), h_Mat, HEIGHT, blasMatrix, HEIGHT);
+	stat2 = cublasSetVector(WIDTH, sizeof(float), h_Act, 1, blasVector, 1);
+	if (stat != CUBLAS_STATUS_SUCCESS || stat2 != CUBLAS_STATUS_SUCCESS)
+	{
+		CLEANUP("Failed to copy BLAS matrix or vector over.", 1);
+	}
 	printGold(h_Mat, h_Act, WIDTH, HEIGHT, data);
 
 	setIndices<<<4, WIDTH / 4>>>(indices);
 	clearPsums<<<HEIGHT, WIDTH>>>(P);
 
+	float alpha = 1.0;
+	float beta = 0.0;
+	stat = cublasSgemv(blasHandle, CUBLAS_OP_N, HEIGHT, WIDTH, &alpha, blasMatrix, HEIGHT, blasVector, 1, &beta, output, 1);
+	if (stat != CUBLAS_STATUS_SUCCESS)
+	{
+		CLEANUP("cuBLAS matrix vector multiplication failed.", 1);
+	}
+	err1 = cudaMemcpy(h_Out, output, sizeof(float) * HEIGHT, cudaMemcpyDeviceToHost);
+	if (err1 != cudaSuccess)
+	{
+		CLEANUP("Failed to copy data back to host.", 1);
+	}
+	printf("-------------------------------------\nGPU Results:\n");		
+	printf("Using BLAS:\n");
+	for (int j = 0; j < HEIGHT; j++)
+	{
+		printf("Output: %f\n", h_Out[j]);
+	}
 	cudppCreate(&handle);
 	CUDPPConfiguration config;
 	config.algorithm = CUDPP_SORT_RADIX;
@@ -300,12 +329,12 @@ int main()
 	{
 		CLEANUP("Failed to copy data back to host.", 1);
 	}
-	printf("-------------------------------------\nGPU Results:\n");		
 	printf("Start pointer: %p End pointer: %p\n", startAddr, endAddr);
 	for (int i = startAddr - data; i < endAddr - data; i++)
 	{
 		printf("Input: %f Index: %d\n", data[i], indices[i]);
 	}
+	printf("Using SST sparse\n");
 	for (int j = 0; j < HEIGHT; j++)
 	{
 		printf("Output: %f\n", h_Out[j]);
