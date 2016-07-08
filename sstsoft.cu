@@ -1,11 +1,14 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include "../cudpp/include/cudpp.h"
 #include "../cudpp/include/cudpp_config.h"
 #include "../cuda/6.5/include/cublas_v2.h"
 #include <cuda_runtime.h>
-#define WIDTH 64
-#define HEIGHT 64
+#include <thrust/sort.h>
+#include <thrust/functional.h>
+#define WIDTH 256
+#define HEIGHT 256
 #define MAX_VAL 120
 
 #define CLEANUP(s, v) \
@@ -14,7 +17,6 @@
 		if (h_Act)			free(h_Act); \
 		if (h_Mat)			free(h_Mat); \
 		if (h_Out)			free(h_Out); \
-		if (handle)			cudppDestroy(handle); \
 		if (blasHandle)		cublasDestroy(blasHandle); \
 		if (data)			cudaFree(data); \
 		if (startAddr)		cudaFree(startAddr); \
@@ -31,7 +33,7 @@
 	} while (0); \
 	return v;
 
-__global__ void setIndices(int* indices)
+__global__ void setIndices(short* indices)
 {
 	unsigned tid = threadIdx.x + blockDim.x * blockIdx.x;
 	indices[tid] = tid;
@@ -48,7 +50,7 @@ __global__ void findLowest(float** result, float* data, int bias)
 }
 
 // launch endAddr(a) - startAddr(a) blocks of height threads each
-__global__ void denseSparseMVM(float* W, float* a, int* ind, unsigned height, unsigned width, float* P)
+__global__ void denseSparseMVM(float* W, float* a, short* ind, unsigned height, unsigned width, float* P)
 {
 	unsigned tid = threadIdx.x;
 	unsigned i = blockIdx.x;
@@ -83,7 +85,16 @@ __global__ void sparseSparseMVM(float* W, float** Wends, int* Windices, float* a
 	}
 }	
 */
-void merge(int low, int mid, int high, float* idata, float* odata, int* iind, int* oind)
+
+struct abs_comp
+{
+	inline bool operator() (float a, float b)
+	{
+		return fabs(a) < fabs(b);
+	}
+};
+
+void merge(int low, int mid, int high, float* idata, float* odata, short* iind, short* oind)
 {
 	int l1, l2, i;
 	for (l1 = low, l2 = mid + 1, i = low; l1 <= mid && l2 <= high; i++)
@@ -116,7 +127,7 @@ void merge(int low, int mid, int high, float* idata, float* odata, int* iind, in
 	}
 }
 
-void mergesort(int low, int high, float* idata, float* odata, int* iind, int* oind)
+void mergesort(int low, int high, float* idata, float* odata, short* iind, short* oind)
 {
 	int mid;
 	if (low < high)
@@ -144,8 +155,8 @@ void matMul(float* matrix, float* vector, float* output, int width, int height)
 void printGold(float* matrix, float* vector, int width, int height, float* dataPtr)
 {
 	float* tempData = (float*)malloc(sizeof(float) * width);
-	int* indices = (int*)malloc(sizeof(int) * width);
-	int* tempIndices = (int*)malloc(sizeof(int) * width);
+	short* indices = (short*)malloc(sizeof(short) * width);
+	short* tempIndices = (short*)malloc(sizeof(short) * width);
 	float* mulResult = (float*)malloc(sizeof(float) * height);
 	for (int i = 0; i < width; i++)
 		indices[i] = i;
@@ -178,14 +189,12 @@ int main()
 	float* h_Mat = (float*)malloc(sizeof(float) * WIDTH * HEIGHT);
 	float* h_Out = (float*)malloc(sizeof(float) * HEIGHT);
 	float temp;
-	CUDPPHandle handle = 0;
-	CUDPPHandle scanplan = 0;
 	cublasStatus_t stat, stat2;
 	cublasHandle_t blasHandle;
 	int nnz = 0;
 	for (int i = 0; i < WIDTH; i++) // generate random floats, which are rectified
 	{
-		temp = (float)rand() / (float)(RAND_MAX / MAX_VAL) - MAX_VAL / 2.5;
+		temp = (float)rand() / (float)(RAND_MAX / MAX_VAL) - MAX_VAL / 1.4;
 		if (temp > 0)
 		{
 			h_Act[i] = temp;
@@ -207,11 +216,11 @@ int main()
 	}
 	// allocate memory on GPU, and copy activation vector over
 	float *data, *output, *matrix, *startAddr, *endAddr, *P, *blasMatrix, *blasVector;
-	int* indices;
+	short* indices;
 	float** foo;
 	float*** lowestAddr = &foo;
 	cudaError_t err1 = cudaMallocManaged(&data, sizeof(float) * WIDTH, cudaMemAttachGlobal);
-	cudaError_t err2 = cudaMallocManaged(&indices, sizeof(int) * WIDTH, cudaMemAttachGlobal);
+	cudaError_t err2 = cudaMallocManaged(&indices, sizeof(short) * WIDTH, cudaMemAttachGlobal);
 	cudaError_t err3 = cudaMallocManaged(&startAddr, sizeof(float), cudaMemAttachGlobal);
 	cudaError_t err4 = cudaMalloc(&output, sizeof(float) * HEIGHT);
 	cudaError_t err5 = cudaMalloc(&matrix, sizeof(float) * HEIGHT * WIDTH);
@@ -265,27 +274,8 @@ int main()
 	{
 		printf("Output: %f\n", h_Out[j]);
 	}
-	cudppCreate(&handle);
-	CUDPPConfiguration config;
-	config.algorithm = CUDPP_SORT_RADIX;
-	config.datatype = CUDPP_FLOAT;
-	config.options = CUDPP_OPTION_KEY_VALUE_PAIRS;
-
-	CUDPPResult res = cudppPlan(handle, &scanplan, config, WIDTH, 1, 0);
-
-	if (res != CUDPP_SUCCESS)
-	{
-		CLEANUP("Failed to create plan.", 1);
-	}
-
-	res = cudppRadixSort(scanplan, data, indices, WIDTH);
-	
-	if (res != CUDPP_SUCCESS)
-	{
-		CLEANUP("Failed to execute radix sort.", 1);
-	}	
+	thrust::sort_by_key(data, data + WIDTH, indices, abs_comp());
 	float* initLow = **lowestAddr;
-	cudaDeviceSynchronize();
 	findLowest<<<2, WIDTH / 4>>>(*lowestAddr, data, 0);
 	cudaDeviceSynchronize();
 	if (**lowestAddr == initLow)
@@ -303,31 +293,10 @@ int main()
 	// perform dense sparse matrix vector multiplication, using the above sparse vector
 	denseSparseMVM<<<endAddr - startAddr, HEIGHT>>>(matrix, startAddr, indices + (startAddr - data), HEIGHT, WIDTH, P);
 	// reduce psums into result
-	CUDPPConfiguration configReduce;
-	configReduce.algorithm = CUDPP_REDUCE;
-	configReduce.op = CUDPP_ADD;
-	configReduce.datatype = CUDPP_FLOAT;
-
-	res = cudppPlan(handle, &scanplan, configReduce, WIDTH, 1, 0);
-	if (res != CUDPP_SUCCESS)
-	{
-		CLEANUP("Failed to create plan.", 1);
-	}
 	cudaDeviceSynchronize();
 	for (int i = 0; i < HEIGHT; i++)
 	{
-		res = cudppReduce(scanplan, output + i, P + i * WIDTH, (endAddr - startAddr)); 
-		if (res != CUDPP_SUCCESS)
-		{
-			CLEANUP("Failed to reduce psums.", 1);
-		}
-	}
-	
-	cudaDeviceSynchronize();
-	err1 = cudaMemcpy(h_Out, output, sizeof(float) * HEIGHT, cudaMemcpyDeviceToHost);
-	if (err1 != cudaSuccess)
-	{
-		CLEANUP("Failed to copy data back to host.", 1);
+		h_Out[i] = thrust::reduce(P + i * WIDTH, P + i * WIDTH + (endAddr - startAddr));
 	}
 	printf("Start pointer: %p End pointer: %p\n", startAddr, endAddr);
 	for (int i = startAddr - data; i < endAddr - data; i++)
@@ -339,6 +308,5 @@ int main()
 	{
 		printf("Output: %f\n", h_Out[j]);
 	}
-	cudppDestroyPlan(scanplan);
 	CLEANUP("Program completed successfully.", 0);
 }
