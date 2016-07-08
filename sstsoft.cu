@@ -1,12 +1,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
-#include "../cudpp/include/cudpp.h"
-#include "../cudpp/include/cudpp_config.h"
-#include "../cuda/6.5/include/cublas_v2.h"
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <thrust/sort.h>
-#include <thrust/functional.h>
 #define WIDTH 256
 #define HEIGHT 256
 #define MAX_VAL 120
